@@ -13,6 +13,8 @@ import {
   approveRefundRequest,
   declineRefundRequest,
   listOpenRefundRequests,
+  markRefundIssued,
+  markRefundFailed,
 } from "./refund-decisions.server";
 
 let testDb: ReturnType<typeof createTestDb>;
@@ -221,5 +223,96 @@ describe("a decided Refund Request is final", () => {
   it("reports an unknown Refund Request as not found", () => {
     expect(approve(9999)).toMatchObject({ ok: false, status: 404 });
     expect(decline(9999)).toMatchObject({ ok: false, status: 404 });
+  });
+});
+
+describe("recording the payout of a Refund", () => {
+  const CONFIRMED_AT = new Date("2026-11-22T15:30:00.000Z");
+
+  function pendingRefund() {
+    const request = raiseRefundRequest(7900);
+    testDb
+      .insert(schema.enrollments)
+      .values({ userId: base.user.id, courseId: base.course.id })
+      .run();
+    const result = approveRefundRequest({
+      refundRequestId: request.id,
+      adminUserId: admin.id,
+    });
+    if (!result.ok) throw new Error("approval failed");
+    return result.refund;
+  }
+
+  const issue = (refundId: number, internalNote?: string) =>
+    markRefundIssued({
+      refundId,
+      adminUserId: admin.id,
+      internalNote,
+      now: CONFIRMED_AT,
+    });
+  const fail = (refundId: number, internalNote?: string) =>
+    markRefundFailed({
+      refundId,
+      adminUserId: admin.id,
+      internalNote,
+      now: CONFIRMED_AT,
+    });
+
+  it("marks a Pending Refund Issued, recording who confirmed it and when", () => {
+    const refund = pendingRefund();
+
+    expect(issue(refund.id, "Paid by bank transfer")).toMatchObject({
+      ok: true,
+      refund: {
+        id: refund.id,
+        status: schema.RefundStatus.Issued,
+        confirmedAt: CONFIRMED_AT.toISOString(),
+        confirmedByUserId: admin.id,
+        internalNote: "Paid by bank transfer",
+      },
+    });
+  });
+
+  it("marks a Pending Refund Failed with an Internal Note", () => {
+    const refund = pendingRefund();
+
+    expect(fail(refund.id, "Card expired")).toMatchObject({
+      ok: true,
+      refund: {
+        status: schema.RefundStatus.Failed,
+        confirmedAt: CONFIRMED_AT.toISOString(),
+        confirmedByUserId: admin.id,
+        internalNote: "Card expired",
+      },
+    });
+  });
+
+  it("marks a Failed Refund Issued once the payout succeeds, keeping the earlier note", () => {
+    const refund = pendingRefund();
+    fail(refund.id, "Card expired");
+
+    expect(issue(refund.id, "Paid to new card")).toMatchObject({
+      ok: true,
+      refund: {
+        status: schema.RefundStatus.Issued,
+        internalNote: "Card expired\nPaid to new card",
+      },
+    });
+  });
+
+  it("rejects every other transition", () => {
+    const failedTwice = pendingRefund();
+    fail(failedTwice.id);
+    expect(fail(failedTwice.id)).toMatchObject({ ok: false, status: 409 });
+
+    const issued = pendingRefund();
+    issue(issued.id);
+    expect(issue(issued.id)).toMatchObject({ ok: false, status: 409 });
+    expect(fail(issued.id)).toMatchObject({ ok: false, status: 409 });
+  });
+
+  it("reports an unknown Refund as not found", () => {
+    expect(issue(9999)).toMatchObject({ ok: false, status: 404 });
+    expect(fail(9999)).toMatchObject({ ok: false, status: 404 });
   });
 });

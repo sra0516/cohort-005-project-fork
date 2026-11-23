@@ -93,6 +93,45 @@ describe("/admin/refunds", () => {
         })
       )
     ).toBe(403);
+    for (const intent of ["issue", "fail"]) {
+      expect(await statusOf(callAction({ intent, refundId: "1" }))).toBe(403);
+    }
+  });
+
+  it("lets an admin mark a Pending Refund Failed and later Issued", async () => {
+    holder.userId = adminId;
+    await callAction({ intent: "approve", refundRequestId: String(refundRequestId) });
+
+    const [pending] = (await callLoader()).pendingAndFailedRefunds;
+    expect(pending).toMatchObject({
+      status: schema.RefundStatus.Pending,
+      amount: 7900,
+      learner: { name: "Test User" },
+      course: { title: "Test Course" },
+    });
+
+    await callAction({
+      intent: "fail",
+      refundId: String(pending.id),
+      internalNote: "Card expired",
+    });
+    expect((await callLoader()).pendingAndFailedRefunds).toMatchObject([
+      { id: pending.id, status: schema.RefundStatus.Failed, internalNote: "Card expired" },
+    ]);
+
+    await callAction({ intent: "issue", refundId: String(pending.id) });
+    expect((await callLoader()).pendingAndFailedRefunds).toEqual([]);
+  });
+
+  it("rejects marking an Issued Refund again", async () => {
+    holder.userId = adminId;
+    await callAction({ intent: "approve", refundRequestId: String(refundRequestId) });
+    const [pending] = (await callLoader()).pendingAndFailedRefunds;
+    await callAction({ intent: "issue", refundId: String(pending.id) });
+
+    const result = await callAction({ intent: "fail", refundId: String(pending.id) });
+
+    expect(result).toMatchObject({ init: { status: 409 } });
   });
 
   it("asks for a user when nobody is in the session", async () => {

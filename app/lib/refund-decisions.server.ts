@@ -1,8 +1,9 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "~/db";
 import { getLearnerCourseProgress } from "~/lib/refund-eligibility.server";
 import {
   courses,
+  enrollments,
   users,
   purchases,
   refundRequests,
@@ -181,4 +182,155 @@ export function declineRefundRequest(
   }
 
   return { ok: true, refundRequest };
+}
+
+/**
+ * Every Refund still waiting on the payout (Pending) or whose payout went wrong
+ * (Failed), oldest approval first.
+ */
+export function listPendingAndFailedRefunds() {
+  return db
+    .select({
+      id: refunds.id,
+      amount: refunds.amount,
+      status: refunds.status,
+      internalNote: refunds.internalNote,
+      confirmedAt: refunds.confirmedAt,
+      approvedAt: refundRequests.decidedAt,
+      learner: { id: users.id, name: users.name, email: users.email },
+      course: { id: courses.id, title: courses.title, slug: courses.slug },
+    })
+    .from(refunds)
+    .innerJoin(refundRequests, eq(refunds.refundRequestId, refundRequests.id))
+    .innerJoin(purchases, eq(refundRequests.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(inArray(refunds.status, [RefundStatus.Pending, RefundStatus.Failed]))
+    .orderBy(asc(refunds.createdAt), asc(refunds.id))
+    .all();
+}
+
+export type PendingOrFailedRefund = ReturnType<
+  typeof listPendingAndFailedRefunds
+>[number];
+
+type ConfirmationInput = {
+  refundId: number;
+  adminUserId: number;
+  internalNote?: string | null;
+  now?: Date;
+};
+
+function unconfirmableRefund(
+  refundId: number,
+  target: RefundStatus
+): RefundDecisionFailure {
+  const refund = db
+    .select({ status: refunds.status })
+    .from(refunds)
+    .where(eq(refunds.id, refundId))
+    .get();
+
+  if (!refund) {
+    return { ok: false, reason: "Refund not found.", status: 404 };
+  }
+
+  return {
+    ok: false,
+    reason:
+      refund.status === RefundStatus.Issued
+        ? "This Refund has already been Issued."
+        : `A ${refund.status} Refund cannot be marked ${target}.`,
+    status: 409,
+  };
+}
+
+/**
+ * Adds a new Internal Note on its own line after any earlier one, so the note
+ * left when a Refund Failed survives it being Issued later.
+ */
+function withInternalNote(internalNote: string | null | undefined) {
+  const note = internalNote?.trim();
+  if (!note) return {};
+  return {
+    internalNote: sql<string>`coalesce(${refunds.internalNote} || char(10), '') || ${note}`,
+  };
+}
+
+/**
+ * Mark a Pending Refund Failed: the payout outside the app did not go through.
+ * The learner keeps access; the Refund can be marked Issued later.
+ */
+export function markRefundFailed(
+  input: ConfirmationInput
+): { ok: true; refund: RefundRow } | RefundDecisionFailure {
+  const refund = db
+    .update(refunds)
+    .set({
+      status: RefundStatus.Failed,
+      confirmedAt: (input.now ?? new Date()).toISOString(),
+      confirmedByUserId: input.adminUserId,
+      ...withInternalNote(input.internalNote),
+    })
+    .where(
+      and(eq(refunds.id, input.refundId), eq(refunds.status, RefundStatus.Pending))
+    )
+    .returning()
+    .get();
+
+  if (!refund) {
+    return unconfirmableRefund(input.refundId, RefundStatus.Failed);
+  }
+
+  return { ok: true, refund };
+}
+
+/**
+ * Mark a Pending or Failed Refund Issued:the payout happened outside the app.
+ * Issued is final. In the same transaction the learner's enrollment is removed,
+ * so they lose access to the course; lesson progress and watch history stay.
+ */
+export function markRefundIssued(
+  input: ConfirmationInput
+): { ok: true; refund: RefundRow } | RefundDecisionFailure {
+  return db.transaction((tx) => {
+    const refund = tx
+      .update(refunds)
+      .set({
+        status: RefundStatus.Issued,
+        confirmedAt: (input.now ?? new Date()).toISOString(),
+        confirmedByUserId: input.adminUserId,
+        ...withInternalNote(input.internalNote),
+      })
+      .where(
+        and(
+          eq(refunds.id, input.refundId),
+          inArray(refunds.status, [RefundStatus.Pending, RefundStatus.Failed])
+        )
+      )
+      .returning()
+      .get();
+
+    if (!refund) {
+      return unconfirmableRefund(input.refundId, RefundStatus.Issued);
+    }
+
+    const purchase = tx
+      .select({ userId: purchases.userId, courseId: purchases.courseId })
+      .from(refundRequests)
+      .innerJoin(purchases, eq(refundRequests.purchaseId, purchases.id))
+      .where(eq(refundRequests.id, refund.refundRequestId))
+      .get()!;
+
+    tx.delete(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, purchase.userId),
+          eq(enrollments.courseId, purchase.courseId)
+        )
+      )
+      .run();
+
+    return { ok: true as const, refund };
+  });
 }

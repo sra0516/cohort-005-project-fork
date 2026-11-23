@@ -1,5 +1,5 @@
 import { data } from "react-router";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
   UserRole,
@@ -7,6 +7,9 @@ import {
   courses,
   enrollments,
   purchases,
+  refundRequests,
+  refunds,
+  RefundStatus,
 } from "~/db/schema";
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
@@ -34,12 +37,28 @@ function isUserEnrolled(userId: number, courseId: number) {
   return !!findEnrollment(userId, courseId);
 }
 
-function findPurchase(userId: number, courseId: number) {
+/**
+ * The learner's purchases of a course, newest first, each marked with whether
+ * an Issued Refund has given the money back. A refunded purchase no longer
+ * grants access; buying the course again creates a fresh one that does.
+ */
+function findPurchases(userId: number, courseId: number) {
   return db
-    .select()
+    .select({
+      purchase: purchases,
+      // Raw names: drizzle leaves columns unqualified in a single-table select,
+      // which would make the correlated subquery ambiguous.
+      refunded: sql<number>`exists (
+        select 1 from refunds r
+        inner join refund_requests rr on rr.id = r.refund_request_id
+        where rr.purchase_id = purchases.id
+          and r.status = ${RefundStatus.Issued}
+      )`,
+    })
     .from(purchases)
     .where(and(eq(purchases.userId, userId), eq(purchases.courseId, courseId)))
-    .get();
+    .orderBy(desc(purchases.createdAt), desc(purchases.id))
+    .all();
 }
 
 // ─── Access Resolution ───
@@ -97,7 +116,12 @@ export async function getAccess(
   const isAdmin = user.role === UserRole.Admin;
   const isOwningInstructor = course?.instructorId === userId;
   const isStaff = isAdmin || isOwningInstructor;
-  const enrolled = isUserEnrolled(userId, courseId);
+  const allPurchases = findPurchases(userId, courseId);
+  const grantingPurchase = allPurchases.find((p) => !p.refunded)?.purchase;
+  // Enrollments without any purchase (coupons, free courses) still count; an
+  // enrollment backed only by refunded purchases does not.
+  const refunded = allPurchases.length > 0 && !grantingPurchase;
+  const enrolled = isUserEnrolled(userId, courseId) && !refunded;
 
   // PPP only restricts students who bought at a discount — staff are exempt.
   let ppp = {
@@ -107,12 +131,11 @@ export async function getAccess(
   };
 
   if (enrolled && !isStaff && course) {
-    const purchase = findPurchase(userId, courseId);
     const currentCountry = await resolveCountry(request);
     ppp = checkPppAccess(
       course.price,
       course.pppEnabled,
-      purchase?.country ?? null,
+      grantingPurchase?.country ?? null,
       currentCountry
     );
   }
