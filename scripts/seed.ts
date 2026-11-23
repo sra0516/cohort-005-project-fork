@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
+import { and, eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
@@ -11,6 +11,7 @@ import {
   CourseStatus,
   LessonProgressStatus,
   RefundRequestStatus,
+  RefundStatus,
   QuestionType,
   TeamMemberRole,
 } from "../app/db/schema";
@@ -2783,6 +2784,144 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log("Created Liam's Refund Request.");
+
+  // ─── One learner per Refund Request outcome ───
+  // So the course page can be demoed for every status: switch to each of these
+  // learners in the DevUI panel and open Introduction to TypeScript. Each gets
+  // a fresh purchase, so it is their latest one on the course.
+
+  type RefundStory = {
+    email: string;
+    reason: string;
+    decision:
+      | { status: RefundRequestStatus.Declined; declineReason: string }
+      | { status: RefundRequestStatus.Approved; refund: RefundStatus };
+    internalNote: string;
+  };
+
+  const refundStories: RefundStory[] = [
+    {
+      email: "omar.rahman@student.dev",
+      reason: "My employer ended up paying for a different course.",
+      decision: {
+        status: RefundRequestStatus.Approved,
+        refund: RefundStatus.Pending,
+      },
+      internalNote: "Straightforward, inside the window.",
+    },
+    {
+      email: "chloe.beaumont@student.dev",
+      reason: "Too basic for me, sorry.",
+      decision: {
+        status: RefundRequestStatus.Approved,
+        refund: RefundStatus.Issued,
+      },
+      internalNote: "Sent from the Stripe dashboard.",
+    },
+    {
+      email: "dmitri.volkov@student.dev",
+      reason: "I bought it twice by accident.",
+      decision: {
+        status: RefundRequestStatus.Approved,
+        refund: RefundStatus.Failed,
+      },
+      internalNote: "Card expired — asked for new details.",
+    },
+    {
+      email: "priya.raghavan@student.dev",
+      reason: "Changed my mind.",
+      decision: {
+        status: RefundRequestStatus.Declined,
+        declineReason:
+          "You have already worked through most of the course, which is past our refund policy.",
+      },
+      internalNote: "Fourth refund ask this year.",
+    },
+  ];
+
+  for (const story of refundStories) {
+    const learner = studentByEmail(story.email);
+    const [purchase] = db
+      .insert(schema.purchases)
+      .values({
+        userId: learner.id,
+        courseId: course1.id,
+        amountPaid: 7900,
+        country: null,
+        createdAt: daysAgo(10),
+      })
+      .returning()
+      .all();
+
+    const issued =
+      story.decision.status === RefundRequestStatus.Approved &&
+      story.decision.refund === RefundStatus.Issued;
+    const enrolledAlready = db
+      .select({ id: schema.enrollments.id })
+      .from(schema.enrollments)
+      .where(
+        and(
+          eq(schema.enrollments.userId, learner.id),
+          eq(schema.enrollments.courseId, course1.id)
+        )
+      )
+      .get();
+    if (issued) {
+      // An Issued Refund ends access to the course.
+      db.delete(schema.enrollments)
+        .where(
+          and(
+            eq(schema.enrollments.userId, learner.id),
+            eq(schema.enrollments.courseId, course1.id)
+          )
+        )
+        .run();
+    } else if (!enrolledAlready) {
+      db.insert(schema.enrollments)
+        .values({
+          userId: learner.id,
+          courseId: course1.id,
+          enrolledAt: daysAgo(10),
+        })
+        .run();
+    }
+
+    const [request] = db
+      .insert(schema.refundRequests)
+      .values({
+        purchaseId: purchase.id,
+        status: story.decision.status,
+        reason: story.reason,
+        requestedAt: daysAgo(6),
+        decidedAt: daysAgo(5),
+        decidedByUserId: admin.id,
+        declineReason:
+          story.decision.status === RefundRequestStatus.Declined
+            ? story.decision.declineReason
+            : null,
+        internalNote: story.internalNote,
+      })
+      .returning()
+      .all();
+
+    if (story.decision.status === RefundRequestStatus.Approved) {
+      const settled = story.decision.refund !== RefundStatus.Pending;
+      db.insert(schema.refunds)
+        .values({
+          refundRequestId: request.id,
+          amount: purchase.amountPaid,
+          status: story.decision.refund,
+          createdAt: daysAgo(5),
+          confirmedAt: settled ? daysAgo(3) : null,
+          confirmedByUserId: settled ? admin.id : null,
+        })
+        .run();
+    }
+  }
+
+  console.log(
+    `Created ${refundStories.length} decided Refund Requests, one per outcome.`
+  );
 
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
