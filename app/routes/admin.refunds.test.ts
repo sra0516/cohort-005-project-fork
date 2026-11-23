@@ -120,7 +120,21 @@ describe("/admin/refunds", () => {
     ]);
 
     await callAction({ intent: "issue", refundId: String(pending.id) });
-    expect((await callLoader()).pendingAndFailedRefunds).toEqual([]);
+    const after = await callLoader();
+    expect(after.pendingAndFailedRefunds).toEqual([]);
+    expect(after.refundHistory).toMatchObject([
+      {
+        id: refundRequestId,
+        status: schema.RefundRequestStatus.Approved,
+        decidedBy: { name: "Ada" },
+        refund: {
+          status: schema.RefundStatus.Issued,
+          failedBy: { name: "Ada" },
+          issuedBy: { name: "Ada" },
+          internalNote: "Card expired",
+        },
+      },
+    ]);
   });
 
   it("rejects marking an Issued Refund again", async () => {

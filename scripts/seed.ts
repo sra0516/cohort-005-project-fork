@@ -2905,15 +2905,17 @@ This course is still in draft while the cluster examples are rewritten against t
       .all();
 
     if (story.decision.status === RefundRequestStatus.Approved) {
-      const settled = story.decision.refund !== RefundStatus.Pending;
+      const failed = story.decision.refund === RefundStatus.Failed;
       db.insert(schema.refunds)
         .values({
           refundRequestId: request.id,
           amount: purchase.amountPaid,
           status: story.decision.refund,
           createdAt: daysAgo(5),
-          confirmedAt: settled ? daysAgo(3) : null,
-          confirmedByUserId: settled ? admin.id : null,
+          failedAt: failed ? daysAgo(3) : null,
+          failedByUserId: failed ? admin.id : null,
+          issuedAt: issued ? daysAgo(3) : null,
+          issuedByUserId: issued ? admin.id : null,
         })
         .run();
     }

@@ -13,6 +13,7 @@ import {
   approveRefundRequest,
   declineRefundRequest,
   listOpenRefundRequests,
+  listRefundHistory,
   markRefundIssued,
   markRefundFailed,
 } from "./refund-decisions.server";
@@ -266,8 +267,10 @@ describe("recording the payout of a Refund", () => {
       refund: {
         id: refund.id,
         status: schema.RefundStatus.Issued,
-        confirmedAt: CONFIRMED_AT.toISOString(),
-        confirmedByUserId: admin.id,
+        issuedAt: CONFIRMED_AT.toISOString(),
+        issuedByUserId: admin.id,
+        failedAt: null,
+        failedByUserId: null,
         internalNote: "Paid by bank transfer",
       },
     });
@@ -280,21 +283,44 @@ describe("recording the payout of a Refund", () => {
       ok: true,
       refund: {
         status: schema.RefundStatus.Failed,
-        confirmedAt: CONFIRMED_AT.toISOString(),
-        confirmedByUserId: admin.id,
+        failedAt: CONFIRMED_AT.toISOString(),
+        failedByUserId: admin.id,
+        issuedAt: null,
+        issuedByUserId: null,
         internalNote: "Card expired",
       },
     });
   });
 
-  it("marks a Failed Refund Issued once the payout succeeds, keeping the earlier note", () => {
+  it("marks a Failed Refund Issued once the payout succeeds, keeping the earlier note and who marked it Failed", () => {
     const refund = pendingRefund();
+    const colleague = testDb
+      .insert(schema.users)
+      .values({
+        name: "Cal Colleague",
+        email: "cal@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get();
     fail(refund.id, "Card expired");
+    const ISSUED_AT = new Date("2026-11-23T09:00:00.000Z");
 
-    expect(issue(refund.id, "Paid to new card")).toMatchObject({
+    expect(
+      markRefundIssued({
+        refundId: refund.id,
+        adminUserId: colleague.id,
+        internalNote: "Paid to new card",
+        now: ISSUED_AT,
+      })
+    ).toMatchObject({
       ok: true,
       refund: {
         status: schema.RefundStatus.Issued,
+        failedAt: CONFIRMED_AT.toISOString(),
+        failedByUserId: admin.id,
+        issuedAt: ISSUED_AT.toISOString(),
+        issuedByUserId: colleague.id,
         internalNote: "Card expired\nPaid to new card",
       },
     });
@@ -314,5 +340,105 @@ describe("recording the payout of a Refund", () => {
   it("reports an unknown Refund as not found", () => {
     expect(issue(9999)).toMatchObject({ ok: false, status: 404 });
     expect(fail(9999)).toMatchObject({ ok: false, status: 404 });
+  });
+});
+
+describe("listRefundHistory", () => {
+  it("lists every decided Refund Request newest first, with its Refund and who did each step when", () => {
+    const colleague = testDb
+      .insert(schema.users)
+      .values({
+        name: "Cal Colleague",
+        email: "cal@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get();
+    const declined = raiseRefundRequest(7900);
+    const approved = raiseRefundRequest(4900);
+    raiseRefundRequest(7900); // still Open, so not history
+
+    declineRefundRequest({
+      refundRequestId: declined.id,
+      adminUserId: colleague.id,
+      declineReason: "Outside the policy.",
+      internalNote: "Fourth ask this year",
+      now: new Date("2026-11-18T10:00:00.000Z"),
+    });
+    const approval = approveRefundRequest({
+      refundRequestId: approved.id,
+      adminUserId: admin.id,
+      internalNote: "Goodwill",
+      now: new Date("2026-11-19T10:00:00.000Z"),
+    });
+    if (!approval.ok) throw new Error("approval failed");
+    markRefundFailed({
+      refundId: approval.refund.id,
+      adminUserId: admin.id,
+      internalNote: "Card expired",
+      now: new Date("2026-11-20T10:00:00.000Z"),
+    });
+    markRefundIssued({
+      refundId: approval.refund.id,
+      adminUserId: colleague.id,
+      internalNote: "Paid to new card",
+      now: new Date("2026-11-21T10:00:00.000Z"),
+    });
+
+    const learner = { id: base.user.id, name: "Test User", email: "test@example.com" };
+    const course = { id: base.course.id, title: "Test Course", slug: "test-course" };
+
+    expect(listRefundHistory()).toEqual([
+      {
+        id: approved.id,
+        status: schema.RefundRequestStatus.Approved,
+        reason: "The course was not for me.",
+        requestedAt: approved.requestedAt,
+        decidedAt: "2026-11-19T10:00:00.000Z",
+        decidedBy: { id: admin.id, name: "Ada Admin" },
+        declineReason: null,
+        internalNote: "Goodwill",
+        amountPaid: 4900,
+        learner,
+        course,
+        refund: {
+          id: approval.refund.id,
+          amount: 4900,
+          status: schema.RefundStatus.Issued,
+          internalNote: "Card expired\nPaid to new card",
+          failedAt: "2026-11-20T10:00:00.000Z",
+          failedBy: { id: admin.id, name: "Ada Admin" },
+          issuedAt: "2026-11-21T10:00:00.000Z",
+          issuedBy: { id: colleague.id, name: "Cal Colleague" },
+        },
+      },
+      {
+        id: declined.id,
+        status: schema.RefundRequestStatus.Declined,
+        reason: "The course was not for me.",
+        requestedAt: declined.requestedAt,
+        decidedAt: "2026-11-18T10:00:00.000Z",
+        decidedBy: { id: colleague.id, name: "Cal Colleague" },
+        declineReason: "Outside the policy.",
+        internalNote: "Fourth ask this year",
+        amountPaid: 7900,
+        learner,
+        course,
+        refund: null,
+      },
+    ]);
+  });
+
+  it("shows a Pending Refund with no confirmation steps yet", () => {
+    const request = raiseRefundRequest();
+    approveRefundRequest({ refundRequestId: request.id, adminUserId: admin.id });
+
+    expect(listRefundHistory()[0].refund).toMatchObject({
+      status: schema.RefundStatus.Pending,
+      failedAt: null,
+      failedBy: null,
+      issuedAt: null,
+      issuedBy: null,
+    });
   });
 });
