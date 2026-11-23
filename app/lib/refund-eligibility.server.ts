@@ -208,6 +208,19 @@ function getSecondsWatched(userId: number, lessonIds: number[]) {
     .reduce((total, row) => total + row.furthest, 0);
 }
 
+/**
+ * How far a learner has got through a course: the progress half of the
+ * eligibility facts, also shown to admins deciding a Refund Request.
+ */
+export function getLearnerCourseProgress(userId: number, courseId: number) {
+  const lessonIds = getLessonIdsForCourse(courseId);
+  return {
+    completedLessonCount: getCompletedLessonCount(userId, lessonIds),
+    totalLessonCount: lessonIds.length,
+    secondsWatched: getSecondsWatched(userId, lessonIds),
+  };
+}
+
 export function getRefundEligibility(
   userId: number,
   courseId: number,
