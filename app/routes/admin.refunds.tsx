@@ -6,7 +6,12 @@ import { eq } from "drizzle-orm";
 import { AlertTriangle, Check, Inbox, X } from "lucide-react";
 import type { Route } from "./+types/admin.refunds";
 import { db } from "~/db";
-import { RefundStatus, UserRole, users } from "~/db/schema";
+import {
+  RefundRequestStatus,
+  RefundStatus,
+  UserRole,
+  users,
+} from "~/db/schema";
 import { getCurrentUserId } from "~/lib/session";
 import { parseFormData } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
@@ -15,10 +20,12 @@ import {
   declineRefundRequest,
   listOpenRefundRequests,
   listPendingAndFailedRefunds,
+  listRefundHistory,
   markRefundFailed,
   markRefundIssued,
   type OpenRefundRequest,
   type PendingOrFailedRefund,
+  type RefundHistoryEntry,
 } from "~/lib/refund-decisions.server";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -124,6 +131,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     openRefundRequests: listOpenRefundRequests(),
     pendingAndFailedRefunds: listPendingAndFailedRefunds(),
+    refundHistory: listRefundHistory(),
   };
 }
 
@@ -354,9 +362,9 @@ function PendingOrFailedRefundCard({
               Approved {new Date(refund.approvedAt).toLocaleDateString()}
             </span>
           )}
-          {failed && refund.confirmedAt && (
+          {failed && refund.failedAt && (
             <span className="text-muted-foreground">
-              · Failed {new Date(refund.confirmedAt).toLocaleDateString()}
+              · Failed {new Date(refund.failedAt).toLocaleDateString()}
             </span>
           )}
         </div>
@@ -453,6 +461,155 @@ function PendingAndFailedRefundsSection({
   );
 }
 
+const REFUND_STATUS_LABELS: Record<RefundStatus, string> = {
+  [RefundStatus.Pending]: "Pending",
+  [RefundStatus.Failed]: "Failed",
+  [RefundStatus.Issued]: "Issued",
+};
+
+function HistoryStep({
+  label,
+  by,
+  at,
+}: {
+  label: string;
+  by: { name: string } | null;
+  at: string | null;
+}) {
+  if (!at) return null;
+  return (
+    <li>
+      <span className="font-medium">{label}</span>{" "}
+      <span className="text-muted-foreground">
+        by {by?.name ?? "unknown"} on {new Date(at).toLocaleString()}
+      </span>
+    </li>
+  );
+}
+
+function InternalNote({ label, note }: { label: string; note: string | null }) {
+  if (!note) return null;
+  return (
+    <div className="rounded-md bg-muted/50 p-3 text-sm">
+      <div className="mb-1 text-xs uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <p className="whitespace-pre-line">{note}</p>
+    </div>
+  );
+}
+
+function RefundHistoryCard({ entry }: { entry: RefundHistoryEntry }) {
+  const declined = entry.status === RefundRequestStatus.Declined;
+  const refund = entry.refund;
+
+  return (
+    <Card>
+      <CardContent className="space-y-3 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <div className="font-medium">{entry.learner.name}</div>
+            <div className="text-sm text-muted-foreground">
+              {entry.learner.email}
+            </div>
+          </div>
+          <div className="text-right">
+            <Link
+              to={`/courses/${entry.course.slug}`}
+              className="font-medium hover:underline"
+            >
+              {entry.course.title}
+            </Link>
+            <div className="text-sm text-muted-foreground">
+              {formatPrice(refund?.amount ?? entry.amountPaid)}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span
+            className={
+              declined
+                ? "rounded-full bg-destructive/10 px-2 py-0.5 font-medium text-destructive"
+                : "rounded-full bg-muted px-2 py-0.5 font-medium"
+            }
+          >
+            {declined ? "Declined" : "Approved"}
+          </span>
+          {refund && (
+            <span className="rounded-full border px-2 py-0.5 font-medium">
+              Refund {REFUND_STATUS_LABELS[refund.status]}
+            </span>
+          )}
+        </div>
+
+        <blockquote className="border-l-2 border-border pl-3 text-sm italic">
+          {entry.reason}
+        </blockquote>
+
+        <ul className="space-y-1 text-sm">
+          <HistoryStep
+            label={declined ? "Declined" : "Approved"}
+            by={entry.decidedBy}
+            at={entry.decidedAt}
+          />
+          {refund && (
+            <>
+              <HistoryStep
+                label="Marked Failed"
+                by={refund.failedBy}
+                at={refund.failedAt}
+              />
+              <HistoryStep
+                label="Marked Issued"
+                by={refund.issuedBy}
+                at={refund.issuedAt}
+              />
+            </>
+          )}
+        </ul>
+
+        {entry.declineReason && (
+          <div className="text-sm">
+            <span className="font-medium">Decline Reason:</span>{" "}
+            {entry.declineReason}
+          </div>
+        )}
+        <InternalNote
+          label="Internal Note on the decision"
+          note={entry.internalNote}
+        />
+        <InternalNote
+          label="Internal Note on the Refund"
+          note={refund?.internalNote ?? null}
+        />
+      </CardContent>
+    </Card>
+  );
+}
+
+function RefundHistorySection({ entries }: { entries: RefundHistoryEntry[] }) {
+  return (
+    <section className="mb-10">
+      <h2 className="mb-4 text-xl font-semibold">History ({entries.length})</h2>
+      {entries.length === 0 ? (
+        <Card>
+          <CardContent className="py-8 text-center text-muted-foreground">
+            <Inbox className="mx-auto mb-3 size-8 text-muted-foreground/50" />
+            No decided Refund Requests yet.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-4">
+          {entries.map((entry) => (
+            <RefundHistoryCard key={entry.id} entry={entry} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function AdminRefunds({ loaderData }: Route.ComponentProps) {
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -475,6 +632,7 @@ export default function AdminRefunds({ loaderData }: Route.ComponentProps) {
       <PendingAndFailedRefundsSection
         refunds={loaderData.pendingAndFailedRefunds}
       />
+      <RefundHistorySection entries={loaderData.refundHistory} />
     </div>
   );
 }

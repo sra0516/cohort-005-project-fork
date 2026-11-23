@@ -278,10 +278,12 @@ export const refunds = sqliteTable("refunds", {
   createdAt: text("created_at")
     .notNull()
     .$defaultFn(() => new Date().toISOString()),
-  confirmedAt: text("confirmed_at"),
-  confirmedByUserId: integer("confirmed_by_user_id").references(
-    () => users.id
-  ),
+  // Who marked the payout Failed and when. Kept once the Refund is later Issued.
+  failedAt: text("failed_at"),
+  failedByUserId: integer("failed_by_user_id").references(() => users.id),
+  // Who marked the payout Issued and when.
+  issuedAt: text("issued_at"),
+  issuedByUserId: integer("issued_by_user_id").references(() => users.id),
   // For the team only — never shown to the learner.
   internalNote: text("internal_note"),
 });

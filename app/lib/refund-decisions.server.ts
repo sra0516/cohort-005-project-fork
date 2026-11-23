@@ -1,4 +1,5 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import { getLearnerCourseProgress } from "~/lib/refund-eligibility.server";
 import {
@@ -195,7 +196,7 @@ export function listPendingAndFailedRefunds() {
       amount: refunds.amount,
       status: refunds.status,
       internalNote: refunds.internalNote,
-      confirmedAt: refunds.confirmedAt,
+      failedAt: refunds.failedAt,
       approvedAt: refundRequests.decidedAt,
       learner: { id: users.id, name: users.name, email: users.email },
       course: { id: courses.id, title: courses.title, slug: courses.slug },
@@ -213,6 +214,92 @@ export function listPendingAndFailedRefunds() {
 export type PendingOrFailedRefund = ReturnType<
   typeof listPendingAndFailedRefunds
 >[number];
+
+function person(id: number | null, name: string | null) {
+  return id === null || name === null ? null : { id, name };
+}
+
+/**
+ * Every decided (Approved or Declined) Refund Request, newest decision first,
+ * with its Refund where one exists, who did each step and when, and every
+ * Internal Note. For admins only: Internal Notes must never reach the learner.
+ */
+export function listRefundHistory() {
+  const decidedBy = alias(users, "decided_by");
+  const failedBy = alias(users, "failed_by");
+  const issuedBy = alias(users, "issued_by");
+
+  const rows = db
+    .select({
+      id: refundRequests.id,
+      status: refundRequests.status,
+      reason: refundRequests.reason,
+      requestedAt: refundRequests.requestedAt,
+      decidedAt: refundRequests.decidedAt,
+      decidedById: decidedBy.id,
+      decidedByName: decidedBy.name,
+      declineReason: refundRequests.declineReason,
+      internalNote: refundRequests.internalNote,
+      amountPaid: purchases.amountPaid,
+      learner: { id: users.id, name: users.name, email: users.email },
+      course: { id: courses.id, title: courses.title, slug: courses.slug },
+      refundId: refunds.id,
+      refundAmount: refunds.amount,
+      refundStatus: refunds.status,
+      refundInternalNote: refunds.internalNote,
+      failedAt: refunds.failedAt,
+      failedById: failedBy.id,
+      failedByName: failedBy.name,
+      issuedAt: refunds.issuedAt,
+      issuedById: issuedBy.id,
+      issuedByName: issuedBy.name,
+    })
+    .from(refundRequests)
+    .innerJoin(purchases, eq(refundRequests.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(decidedBy, eq(refundRequests.decidedByUserId, decidedBy.id))
+    .leftJoin(refunds, eq(refunds.refundRequestId, refundRequests.id))
+    .leftJoin(failedBy, eq(refunds.failedByUserId, failedBy.id))
+    .leftJoin(issuedBy, eq(refunds.issuedByUserId, issuedBy.id))
+    .where(
+      inArray(refundRequests.status, [
+        RefundRequestStatus.Approved,
+        RefundRequestStatus.Declined,
+      ])
+    )
+    .orderBy(desc(refundRequests.decidedAt), desc(refundRequests.id))
+    .all();
+
+  return rows.map((row) => ({
+    id: row.id,
+    status: row.status,
+    reason: row.reason,
+    requestedAt: row.requestedAt,
+    decidedAt: row.decidedAt,
+    decidedBy: person(row.decidedById, row.decidedByName),
+    declineReason: row.declineReason,
+    internalNote: row.internalNote,
+    amountPaid: row.amountPaid,
+    learner: row.learner,
+    course: row.course,
+    refund:
+      row.refundId === null
+        ? null
+        : {
+            id: row.refundId,
+            amount: row.refundAmount!,
+            status: row.refundStatus!,
+            internalNote: row.refundInternalNote,
+            failedAt: row.failedAt,
+            failedBy: person(row.failedById, row.failedByName),
+            issuedAt: row.issuedAt,
+            issuedBy: person(row.issuedById, row.issuedByName),
+          },
+  }));
+}
+
+export type RefundHistoryEntry = ReturnType<typeof listRefundHistory>[number];
 
 type ConfirmationInput = {
   refundId: number;
@@ -268,8 +355,8 @@ export function markRefundFailed(
     .update(refunds)
     .set({
       status: RefundStatus.Failed,
-      confirmedAt: (input.now ?? new Date()).toISOString(),
-      confirmedByUserId: input.adminUserId,
+      failedAt: (input.now ?? new Date()).toISOString(),
+      failedByUserId: input.adminUserId,
       ...withInternalNote(input.internalNote),
     })
     .where(
@@ -298,8 +385,8 @@ export function markRefundIssued(
       .update(refunds)
       .set({
         status: RefundStatus.Issued,
-        confirmedAt: (input.now ?? new Date()).toISOString(),
-        confirmedByUserId: input.adminUserId,
+        issuedAt: (input.now ?? new Date()).toISOString(),
+        issuedByUserId: input.adminUserId,
         ...withInternalNote(input.internalNote),
       })
       .where(
