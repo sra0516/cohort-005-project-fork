@@ -51,6 +51,8 @@ import {
 import { parseFormData } from "~/lib/validation";
 import { MAX_RATING, MIN_RATING } from "~/lib/ratings";
 import { getRefundEligibility } from "~/lib/refund-eligibility.server";
+import { getRefundStanding } from "~/lib/refund-standing.server";
+import type { RefundStanding } from "~/lib/refund-standing";
 import { StarRating, StarRatingInput } from "~/components/star-rating";
 
 function getCourseBySlug(slug: string) {
@@ -408,8 +410,12 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
   let refundOffer: { amount: number; lastDayInWindow: string } | null = null;
+  let refundStanding: RefundStanding | null = null;
 
   if (currentUserId) {
+    // Not only for enrolled learners: an Issued Refund ends the enrollment,
+    // and the learner should still see that it went through.
+    refundStanding = getRefundStanding(currentUserId, course.id);
     enrolled = isUserEnrolled(currentUserId, course.id);
 
     if (enrolled) {
@@ -458,6 +464,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ratingSummary,
     userRating,
     refundOffer,
+    refundStanding,
   };
 }
 
@@ -559,6 +566,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     ratingSummary,
     userRating,
     refundOffer,
+    refundStanding,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -752,6 +760,9 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               </h2>
             </CardHeader>
             <CardContent className="space-y-4">
+              {!isInstructor && refundStanding && (
+                <RefundStandingNotice standing={refundStanding} />
+              )}
               {isInstructor ? (
                 <Link to={`/instructor/${course.id}`}>
                   <Button className="w-full">
@@ -867,6 +878,18 @@ function RateCourse({ userRating }: { userRating: number | null }) {
           Click a star to change your rating.
         </p>
       )}
+    </div>
+  );
+}
+
+function RefundStandingNotice({ standing }: { standing: RefundStanding }) {
+  return (
+    <div
+      className="rounded-md border bg-muted/50 p-3 text-sm"
+      data-refund-standing={standing.kind}
+    >
+      <p className="font-medium">{standing.heading}</p>
+      <p className="mt-1 text-muted-foreground">{standing.message}</p>
     </div>
   );
 }
