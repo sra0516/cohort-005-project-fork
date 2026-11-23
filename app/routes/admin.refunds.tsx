@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import { AlertTriangle, Check, Inbox, X } from "lucide-react";
 import type { Route } from "./+types/admin.refunds";
 import { db } from "~/db";
-import { UserRole, users } from "~/db/schema";
+import { RefundStatus, UserRole, users } from "~/db/schema";
 import { getCurrentUserId } from "~/lib/session";
 import { parseFormData } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
@@ -14,7 +14,11 @@ import {
   approveRefundRequest,
   declineRefundRequest,
   listOpenRefundRequests,
+  listPendingAndFailedRefunds,
+  markRefundFailed,
+  markRefundIssued,
   type OpenRefundRequest,
+  type PendingOrFailedRefund,
 } from "~/lib/refund-decisions.server";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -33,7 +37,56 @@ const refundActionSchema = z.discriminatedUnion("intent", [
     declineReason: z.string().trim().max(1000).default(""),
     internalNote: z.string().trim().max(1000).optional(),
   }),
+  z.object({
+    intent: z.literal("issue"),
+    refundId: z.coerce.number().int(),
+    internalNote: z.string().trim().max(1000).optional(),
+  }),
+  z.object({
+    intent: z.literal("fail"),
+    refundId: z.coerce.number().int(),
+    internalNote: z.string().trim().max(1000).optional(),
+  }),
 ]);
+
+type RefundAction = z.infer<typeof refundActionSchema>;
+
+function runRefundAction(input: RefundAction, adminUserId: number) {
+  switch (input.intent) {
+    case "approve":
+      return approveRefundRequest({
+        refundRequestId: input.refundRequestId,
+        adminUserId,
+        internalNote: input.internalNote,
+      });
+    case "decline":
+      return declineRefundRequest({
+        refundRequestId: input.refundRequestId,
+        adminUserId,
+        declineReason: input.declineReason,
+        internalNote: input.internalNote,
+      });
+    case "issue":
+      return markRefundIssued({
+        refundId: input.refundId,
+        adminUserId,
+        internalNote: input.internalNote,
+      });
+    case "fail":
+      return markRefundFailed({
+        refundId: input.refundId,
+        adminUserId,
+        internalNote: input.internalNote,
+      });
+  }
+}
+
+const SUCCESS_MESSAGES: Record<RefundAction["intent"], string> = {
+  approve: "Refund Request approved. The Refund is now pending.",
+  decline: "Refund Request declined.",
+  issue: "Refund marked Issued. The learner no longer has access.",
+  fail: "Refund marked Failed. The learner keeps access for now.",
+};
 
 /** Every loader and action on this screen is for admins only. */
 async function requireAdmin(request: Request) {
@@ -68,7 +121,10 @@ export function meta() {
 export async function loader({ request }: Route.LoaderArgs) {
   await requireAdmin(request);
 
-  return { openRefundRequests: listOpenRefundRequests() };
+  return {
+    openRefundRequests: listOpenRefundRequests(),
+    pendingAndFailedRefunds: listPendingAndFailedRefunds(),
+  };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -80,32 +136,13 @@ export async function action({ request }: Route.ActionArgs) {
     return data({ error: Object.values(parsed.errors)[0] }, { status: 400 });
   }
 
-  const input = parsed.data;
-  const result =
-    input.intent === "approve"
-      ? approveRefundRequest({
-          refundRequestId: input.refundRequestId,
-          adminUserId: admin.id,
-          internalNote: input.internalNote,
-        })
-      : declineRefundRequest({
-          refundRequestId: input.refundRequestId,
-          adminUserId: admin.id,
-          declineReason: input.declineReason,
-          internalNote: input.internalNote,
-        });
+  const result = runRefundAction(parsed.data, admin.id);
 
   if (!result.ok) {
     return data({ error: result.reason }, { status: result.status });
   }
 
-  return {
-    success: true,
-    message:
-      input.intent === "approve"
-        ? "Refund Request approved. The Refund is now pending."
-        : "Refund Request declined.",
-  };
+  return { success: true, message: SUCCESS_MESSAGES[parsed.data.intent] };
 }
 
 function Fact({ label, value }: { label: string; value: string }) {
@@ -263,6 +300,159 @@ function OpenRefundRequestsSection({
   );
 }
 
+function PendingOrFailedRefundCard({
+  refund,
+}: {
+  refund: PendingOrFailedRefund;
+}) {
+  const fetcher = useFetcher<typeof action>();
+  const [mode, setMode] = useState<"idle" | "issue" | "fail">("idle");
+  const busy = fetcher.state !== "idle";
+  const failed = refund.status === RefundStatus.Failed;
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) toast.error(fetcher.data.error);
+    if ("success" in fetcher.data) toast.success(fetcher.data.message);
+  }, [fetcher.state, fetcher.data]);
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <div className="font-medium">{refund.learner.name}</div>
+            <div className="text-sm text-muted-foreground">
+              {refund.learner.email}
+            </div>
+          </div>
+          <div className="text-right">
+            <Link
+              to={`/courses/${refund.course.slug}`}
+              className="font-medium hover:underline"
+            >
+              {refund.course.title}
+            </Link>
+            <div className="text-sm text-muted-foreground">
+              {formatPrice(refund.amount)} to refund
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span
+            className={
+              failed
+                ? "rounded-full bg-destructive/10 px-2 py-0.5 font-medium text-destructive"
+                : "rounded-full bg-muted px-2 py-0.5 font-medium"
+            }
+          >
+            {failed ? "Failed" : "Pending"}
+          </span>
+          {refund.approvedAt && (
+            <span className="text-muted-foreground">
+              Approved {new Date(refund.approvedAt).toLocaleDateString()}
+            </span>
+          )}
+          {failed && refund.confirmedAt && (
+            <span className="text-muted-foreground">
+              · Failed {new Date(refund.confirmedAt).toLocaleDateString()}
+            </span>
+          )}
+        </div>
+
+        {refund.internalNote && (
+          <p className="whitespace-pre-line rounded-md bg-muted/50 p-3 text-sm">
+            {refund.internalNote}
+          </p>
+        )}
+
+        {mode === "idle" ? (
+          <div className="flex gap-2">
+            <Button size="sm" onClick={() => setMode("issue")}>
+              <Check className="mr-1.5 size-3.5" />
+              Mark Issued
+            </Button>
+            {!failed && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setMode("fail")}
+              >
+                <X className="mr-1.5 size-3.5" />
+                Mark Failed
+              </Button>
+            )}
+          </div>
+        ) : (
+          <fetcher.Form method="post" className="space-y-3">
+            <input type="hidden" name="intent" value={mode} />
+            <input type="hidden" name="refundId" value={refund.id} />
+            {mode === "issue" && (
+              <p className="text-sm text-muted-foreground">
+                Issued is final. The learner loses access to the course; their
+                progress is kept.
+              </p>
+            )}
+            <div className="space-y-1.5">
+              <Label htmlFor={`refundNote-${refund.id}`}>
+                Internal Note (optional, never shown to the learner)
+              </Label>
+              <Textarea id={`refundNote-${refund.id}`} name="internalNote" />
+            </div>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                type="submit"
+                variant={mode === "fail" ? "destructive" : "default"}
+                disabled={busy}
+              >
+                {mode === "issue" ? "Confirm Issued" : "Confirm Failed"}
+              </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="ghost"
+                onClick={() => setMode("idle")}
+              >
+                Cancel
+              </Button>
+            </div>
+          </fetcher.Form>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PendingAndFailedRefundsSection({
+  refunds,
+}: {
+  refunds: PendingOrFailedRefund[];
+}) {
+  return (
+    <section className="mb-10">
+      <h2 className="mb-4 text-xl font-semibold">
+        Pending &amp; Failed Refunds ({refunds.length})
+      </h2>
+      {refunds.length === 0 ? (
+        <Card>
+          <CardContent className="py-8 text-center text-muted-foreground">
+            <Inbox className="mx-auto mb-3 size-8 text-muted-foreground/50" />
+            No Pending or Failed Refunds.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-4">
+          {refunds.map((refund) => (
+            <PendingOrFailedRefundCard key={refund.id} refund={refund} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function AdminRefunds({ loaderData }: Route.ComponentProps) {
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -282,6 +472,9 @@ export default function AdminRefunds({ loaderData }: Route.ComponentProps) {
       </div>
 
       <OpenRefundRequestsSection requests={loaderData.openRefundRequests} />
+      <PendingAndFailedRefundsSection
+        refunds={loaderData.pendingAndFailedRefunds}
+      />
     </div>
   );
 }
