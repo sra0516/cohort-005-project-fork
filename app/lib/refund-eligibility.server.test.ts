@@ -4,6 +4,7 @@ import {
   REFUND_WATCH_LIMIT_SECONDS,
   type RefundEligibilityFacts,
 } from "./refund-eligibility.server";
+import { RefundStatus } from "~/db/schema";
 
 const PURCHASED_AT = new Date(2026, 10, 1, 23, 0).toISOString();
 
@@ -11,6 +12,7 @@ function facts(overrides: Partial<RefundEligibilityFacts> = {}) {
   return {
     purchase: { id: 7, amountPaid: 4900, createdAt: PURCHASED_AT },
     hasOpenRefundRequest: false,
+    refundStatuses: [],
     hasClaimedSeat: false,
     completedLessonCount: 0,
     totalLessonCount: 10,
@@ -40,6 +42,32 @@ describe("decideRefundEligibility", () => {
     expect(
       decideRefundEligibility(facts({ hasOpenRefundRequest: true }))
     ).toMatchObject({ eligible: false, status: 409 });
+  });
+
+  it("refuses a new request while the purchase has a Pending Refund", () => {
+    expect(
+      decideRefundEligibility(facts({ refundStatuses: [RefundStatus.Pending] }))
+    ).toMatchObject({ eligible: false, status: 409 });
+  });
+
+  it("refuses a new request while the purchase has a Failed Refund", () => {
+    expect(
+      decideRefundEligibility(facts({ refundStatuses: [RefundStatus.Failed] }))
+    ).toMatchObject({ eligible: false, status: 409 });
+  });
+
+  it("does not block a new request on an Issued Refund by this rule", () => {
+    expect(
+      decideRefundEligibility(facts({ refundStatuses: [RefundStatus.Issued] }))
+    ).toMatchObject({ eligible: true });
+  });
+
+  it("allows a new request when past requests were only Declined", () => {
+    expect(
+      decideRefundEligibility(
+        facts({ hasOpenRefundRequest: false, refundStatuses: [] })
+      )
+    ).toMatchObject({ eligible: true });
   });
 
   it("refuses a claimed team seat", () => {

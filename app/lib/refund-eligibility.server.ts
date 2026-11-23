@@ -9,6 +9,8 @@ import {
   purchases,
   refundRequests,
   RefundRequestStatus,
+  refunds,
+  RefundStatus,
   videoWatchEvents,
 } from "~/db/schema";
 
@@ -19,6 +21,8 @@ export const REFUND_COMPLETION_LIMIT = 0.5;
 export type RefundEligibilityFacts = {
   purchase: { id: number; amountPaid: number; createdAt: string } | undefined;
   hasOpenRefundRequest: boolean;
+  /** Statuses of every Refund on this purchase's Approved Refund Requests. */
+  refundStatuses: RefundStatus[];
   hasClaimedSeat: boolean;
   completedLessonCount: number;
   totalLessonCount: number;
@@ -67,6 +71,19 @@ export function decideRefundEligibility(
     return {
       eligible: false,
       reason: "You already have an open refund request on this purchase.",
+      status: 409,
+    };
+  }
+
+  if (
+    facts.refundStatuses.some(
+      (status) =>
+        status === RefundStatus.Pending || status === RefundStatus.Failed
+    )
+  ) {
+    return {
+      eligible: false,
+      reason: "This purchase already has a refund in progress.",
       status: 409,
     };
   }
@@ -160,6 +177,16 @@ function hasOpenRefundRequest(purchaseId: number) {
   return row !== undefined;
 }
 
+function getRefundStatuses(purchaseId: number): RefundStatus[] {
+  return db
+    .select({ status: refunds.status })
+    .from(refunds)
+    .innerJoin(refundRequests, eq(refunds.refundRequestId, refundRequests.id))
+    .where(eq(refundRequests.purchaseId, purchaseId))
+    .all()
+    .map((row) => row.status);
+}
+
 function hasClaimedSeat(purchaseId: number) {
   const row = db
     .select({ id: coupons.id })
@@ -208,6 +235,19 @@ function getSecondsWatched(userId: number, lessonIds: number[]) {
     .reduce((total, row) => total + row.furthest, 0);
 }
 
+/**
+ * How far a learner has got through a course: the progress half of the
+ * eligibility facts, also shown to admins deciding a Refund Request.
+ */
+export function getLearnerCourseProgress(userId: number, courseId: number) {
+  const lessonIds = getLessonIdsForCourse(courseId);
+  return {
+    completedLessonCount: getCompletedLessonCount(userId, lessonIds),
+    totalLessonCount: lessonIds.length,
+    secondsWatched: getSecondsWatched(userId, lessonIds),
+  };
+}
+
 export function getRefundEligibility(
   userId: number,
   courseId: number,
@@ -219,6 +259,7 @@ export function getRefundEligibility(
   return decideRefundEligibility({
     purchase,
     hasOpenRefundRequest: purchase ? hasOpenRefundRequest(purchase.id) : false,
+    refundStatuses: purchase ? getRefundStatuses(purchase.id) : [],
     hasClaimedSeat: purchase ? hasClaimedSeat(purchase.id) : false,
     completedLessonCount: getCompletedLessonCount(userId, lessonIds),
     totalLessonCount: lessonIds.length,
